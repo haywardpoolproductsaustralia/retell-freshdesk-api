@@ -1,5 +1,3 @@
-const { app } = require('@azure/functions');
-
 const FRESHDESK_DOMAIN = process.env.FRESHDESK_DOMAIN;
 const FRESHDESK_API_KEY = process.env.FRESHDESK_API_KEY;
 
@@ -20,7 +18,6 @@ function mapStatusAgent(status) {
   }[status] || `Status ${status}`;
 }
 
-// Customer-facing labels based on your Freshdesk setup
 function mapStatusCustomer(agentLabel) {
   const map = {
     Open: 'Being Processed',
@@ -53,11 +50,7 @@ async function fdFetch(path) {
     data = text;
   }
 
-  return {
-    ok: res.ok,
-    status: res.status,
-    data
-  };
+  return { ok: res.ok, status: res.status, data };
 }
 
 async function fdGet(path) {
@@ -70,16 +63,11 @@ async function fdGet(path) {
 
 async function resolveTicket(ticketInput) {
   const normalized = String(ticketInput || '').trim();
-
   if (!normalized) return null;
 
-  // First try direct ticket lookup
   const direct = await fdFetch(`/api/v2/tickets/${encodeURIComponent(normalized)}?include=requester,company`);
-  if (direct.ok && direct.data) {
-    return direct.data;
-  }
+  if (direct.ok && direct.data) return direct.data;
 
-  // If direct lookup fails, try searching by display_id
   const search = await fdFetch(
     `/api/v2/search/tickets?query=${encodeURIComponent(`"display_id:${normalized}"`)}`
   );
@@ -96,9 +84,7 @@ async function resolveTicket(ticketInput) {
 
 function sanitizeCustomerUpdate(text) {
   if (!text) return '';
-
   let cleaned = stripHtml(text);
-
   cleaned = cleaned
     .replace(/\burgent\b\s*:?/gi, '')
     .replace(/\bplease allocate\b.*$/gi, '')
@@ -117,22 +103,16 @@ function sanitizeCustomerUpdate(text) {
     .replace(/\bagent id\b.*$/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
-
   return cleaned;
 }
 
 function summarizeCustomerUpdate(text) {
   const cleaned = sanitizeCustomerUpdate(text);
   if (!cleaned) return '';
-
   if (cleaned.length <= 160) return cleaned;
-
   const shortened = cleaned.slice(0, 160);
   const lastSentence = shortened.lastIndexOf('.');
-  if (lastSentence > 80) {
-    return shortened.slice(0, lastSentence + 1).trim();
-  }
-
+  if (lastSentence > 80) return shortened.slice(0, lastSentence + 1).trim();
   const lastSpace = shortened.lastIndexOf(' ');
   return `${shortened.slice(0, lastSpace).trim()}...`;
 }
@@ -142,17 +122,14 @@ function buildCustomerSpokenSummary(ticketId, customerStatusLabel, subject, late
     `I've found your request.`,
     `Ticket ${ticketId} is currently ${customerStatusLabel}.`
   ];
-
   if (subject && subject !== 'No subject recorded') {
     parts.push(`This is regarding ${subject}.`);
   }
-
   if (latestUpdate) {
     parts.push(`The latest update is: ${latestUpdate}`);
   } else {
     parts.push(`Our team is currently working on it.`);
   }
-
   return parts.join(' ');
 }
 
@@ -177,153 +154,134 @@ function getCustomerVisibleCustomFields(ticket, ticketFields) {
 
 async function getLatestCustomerUpdate(ticketId) {
   const res = await fdFetch(`/api/v2/tickets/${ticketId}/conversations`);
+  if (!res.ok || !Array.isArray(res.data)) return '';
 
-  if (!res.ok || !Array.isArray(res.data)) {
-    return '';
-  }
-
-  // Prefer the most recent non-private conversation with readable content
   const ordered = [...res.data].reverse();
-
   for (const convo of ordered) {
     if (convo.private === true) continue;
-
-    const raw =
-      convo.body_text ||
-      convo.plain_text_body ||
-      convo.body ||
-      '';
-
+    const raw = convo.body_text || convo.plain_text_body || convo.body || '';
     const cleaned = summarizeCustomerUpdate(raw);
     if (cleaned) return cleaned;
   }
-
   return '';
 }
 
-app.http('lookup-ticket', {
-  methods: ['POST'],
-  authLevel: 'anonymous',
-  handler: async (request, context) => {
-    try {
-      const body = await request.json().catch(() => ({}));
-      const ticketInput = body?.ticket_id;
+// ─── Vercel Serverless Handler ────────────────────────────────────────────────
+export default async function handler(req, res) {
+  // Allow Retell (and browsers) to call this endpoint
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-      if (!ticketInput) {
-        return {
-          jsonBody: {
-            found: false,
-            spoken_summary: 'Please provide a ticket number.'
-          }
-        };
-      }
-
-      const ticket = await resolveTicket(ticketInput);
-
-      if (!ticket) {
-        return {
-          jsonBody: {
-            found: false,
-            spoken_summary: "I couldn't find that ticket. Please check the number and try again."
-          }
-        };
-      }
-
-      const ticketFields = await fdGet('/api/v2/admin/ticket_fields');
-
-      const statusField = Array.isArray(ticketFields)
-        ? ticketFields.find(f => f.name === 'status')
-        : null;
-
-      const subjectField = Array.isArray(ticketFields)
-        ? ticketFields.find(f => f.name === 'subject')
-        : null;
-
-      const descriptionField = Array.isArray(ticketFields)
-        ? ticketFields.find(f => f.name === 'description')
-        : null;
-
-      const agentStatusLabel = mapStatusAgent(ticket.status);
-      const customerStatusLabel = mapStatusCustomer(agentStatusLabel);
-
-      const subject =
-        ticket.subject && ticket.subject.trim()
-          ? ticket.subject.trim()
-          : 'No subject recorded';
-
-      const description =
-        stripHtml(ticket.description_text || ticket.description || '') ||
-        'No description recorded';
-
-      const requester = ticket.requester || {};
-      const company = ticket.company || {};
-
-      const customerVisibleCustomFields = getCustomerVisibleCustomFields(ticket, ticketFields);
-
-      const conversationUpdate = await getLatestCustomerUpdate(ticket.id).catch(() => '');
-      const descriptionUpdate =
-        description && description !== 'No description recorded'
-          ? summarizeCustomerUpdate(description)
-          : '';
-
-      const latestUpdate = conversationUpdate || descriptionUpdate || '';
-
-      const brief_summary =
-        latestUpdate
-          ? `Ticket ${ticket.display_id || ticket.id} is currently ${customerStatusLabel}. Latest update: ${latestUpdate}`
-          : `Ticket ${ticket.display_id || ticket.id} is currently ${customerStatusLabel}.`;
-
-      const spoken_summary = buildCustomerSpokenSummary(
-        ticket.display_id || ticket.id,
-        customerStatusLabel,
-        subject,
-        latestUpdate
-      );
-
-      return {
-        jsonBody: {
-          found: true,
-          ticket_id: ticket.id,
-          display_id: ticket.display_id || null,
-          status: {
-            raw_value: ticket.status,
-            agent_label: agentStatusLabel,
-            customer_field_label: statusField?.label_for_customers || 'Status',
-            customer_value_label: customerStatusLabel
-          },
-          subject: {
-            value: subject,
-            customer_label: subjectField?.label_for_customers || 'Subject'
-          },
-          description: {
-            value: description,
-            customer_label: descriptionField?.label_for_customers || 'Description'
-          },
-          requester: {
-            id: requester.id || null,
-            name: requester.name || '',
-            email: requester.email || '',
-            phone: requester.phone || requester.mobile || ''
-          },
-          company: {
-            id: company.id || null,
-            name: company.name || ''
-          },
-          custom_fields_for_customers: customerVisibleCustomFields,
-          latest_update: latestUpdate,
-          brief_summary,
-          spoken_summary,
-          raw_ticket: ticket
-        }
-      };
-    } catch (err) {
-      context.log('lookup-ticket error', err);
-      return {
-        jsonBody: {
-          found: false,
-          spoken_summary: "I couldn't retrieve the ticket details right now."
-        }
-      };
-    }
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
-});
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+    const ticketInput = body?.ticket_id;
+
+    if (!ticketInput) {
+      return res.status(200).json({
+        found: false,
+        spoken_summary: 'Please provide a ticket number.'
+      });
+    }
+
+    const ticket = await resolveTicket(ticketInput);
+
+    if (!ticket) {
+      return res.status(200).json({
+        found: false,
+        spoken_summary: "I couldn't find that ticket. Please check the number and try again."
+      });
+    }
+
+    const ticketFields = await fdGet('/api/v2/admin/ticket_fields');
+
+    const statusField = Array.isArray(ticketFields)
+      ? ticketFields.find(f => f.name === 'status') : null;
+    const subjectField = Array.isArray(ticketFields)
+      ? ticketFields.find(f => f.name === 'subject') : null;
+    const descriptionField = Array.isArray(ticketFields)
+      ? ticketFields.find(f => f.name === 'description') : null;
+
+    const agentStatusLabel = mapStatusAgent(ticket.status);
+    const customerStatusLabel = mapStatusCustomer(agentStatusLabel);
+
+    const subject = ticket.subject?.trim() || 'No subject recorded';
+    const description =
+      stripHtml(ticket.description_text || ticket.description || '') ||
+      'No description recorded';
+
+    const requester = ticket.requester || {};
+    const company = ticket.company || {};
+
+    const customerVisibleCustomFields = getCustomerVisibleCustomFields(ticket, ticketFields);
+
+    const conversationUpdate = await getLatestCustomerUpdate(ticket.id).catch(() => '');
+    const descriptionUpdate =
+      description !== 'No description recorded'
+        ? summarizeCustomerUpdate(description)
+        : '';
+
+    const latestUpdate = conversationUpdate || descriptionUpdate || '';
+
+    const brief_summary = latestUpdate
+      ? `Ticket ${ticket.display_id || ticket.id} is currently ${customerStatusLabel}. Latest update: ${latestUpdate}`
+      : `Ticket ${ticket.display_id || ticket.id} is currently ${customerStatusLabel}.`;
+
+    const spoken_summary = buildCustomerSpokenSummary(
+      ticket.display_id || ticket.id,
+      customerStatusLabel,
+      subject,
+      latestUpdate
+    );
+
+    return res.status(200).json({
+      found: true,
+      ticket_id: ticket.id,
+      display_id: ticket.display_id || null,
+      status: {
+        raw_value: ticket.status,
+        agent_label: agentStatusLabel,
+        customer_field_label: statusField?.label_for_customers || 'Status',
+        customer_value_label: customerStatusLabel
+      },
+      subject: {
+        value: subject,
+        customer_label: subjectField?.label_for_customers || 'Subject'
+      },
+      description: {
+        value: description,
+        customer_label: descriptionField?.label_for_customers || 'Description'
+      },
+      requester: {
+        id: requester.id || null,
+        name: requester.name || '',
+        email: requester.email || '',
+        phone: requester.phone || requester.mobile || ''
+      },
+      company: {
+        id: company.id || null,
+        name: company.name || ''
+      },
+      custom_fields_for_customers: customerVisibleCustomFields,
+      latest_update: latestUpdate,
+      brief_summary,
+      spoken_summary,
+      raw_ticket: ticket
+    });
+
+  } catch (err) {
+    console.error('lookup-ticket error', err);
+    return res.status(500).json({
+      found: false,
+      spoken_summary: "I couldn't retrieve the ticket details right now."
+    });
+  }
+}
