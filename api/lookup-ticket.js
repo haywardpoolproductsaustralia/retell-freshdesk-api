@@ -62,24 +62,31 @@ async function fdGet(path) {
 }
 
 async function resolveTicket(ticketInput) {
-  const normalized = String(ticketInput || '').trim();
+  const normalized = String(ticketInput || '').trim().replace(/^#/, '');
   if (!normalized) return null;
 
+  // 1. Try direct lookup by internal ID (works if user passes internal ID)
   const direct = await fdFetch(`/api/v2/tickets/${encodeURIComponent(normalized)}?include=requester,company`);
-  if (direct.ok && direct.data) return direct.data;
+  if (direct.ok && direct.data && direct.data.id) return direct.data;
 
-  const search = await fdFetch(
-    `/api/v2/search/tickets?query=${encodeURIComponent(`"display_id:${normalized}"`)}`
-  );
+  // 2. Search by display_id - correct Freshdesk search syntax
+  const searchQuery = encodeURIComponent(`display_id:${normalized}`);
+  const search = await fdFetch(`/api/v2/search/tickets?query="${searchQuery}"`);
 
-  if (!search.ok || !search.data || !Array.isArray(search.data.results) || search.data.results.length === 0) {
-    return null;
+  if (search.ok && search.data && Array.isArray(search.data.results) && search.data.results.length > 0) {
+    const internalId = search.data.results[0].id;
+    if (internalId) {
+      return await fdGet(`/api/v2/tickets/${internalId}?include=requester,company`);
+    }
   }
 
-  const internalId = search.data.results[0].id;
-  if (!internalId) return null;
+  // 3. Fallback: filter tickets by display_id using list endpoint
+  const list = await fdFetch(`/api/v2/tickets?display_id=${encodeURIComponent(normalized)}&include=requester,company`);
+  if (list.ok && Array.isArray(list.data) && list.data.length > 0) {
+    return list.data[0];
+  }
 
-  return await fdGet(`/api/v2/tickets/${internalId}?include=requester,company`);
+  return null;
 }
 
 function sanitizeCustomerUpdate(text) {
