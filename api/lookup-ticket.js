@@ -45,6 +45,24 @@ async function fdGet(path) {
   return res.data;
 }
 
+// ─── Scan recent tickets and match against custom fields ──────────────────────
+// Freshdesk does not allow searching custom fields via its search API,
+// so we page through recent tickets and match locally.
+async function scanTicketsByCustomField(matchFn, maxPages = 5) {
+  let page = 1;
+  while (page <= maxPages) {
+    const res = await fdFetch(
+      `/api/v2/tickets?per_page=100&page=${page}&order_by=created_at&order_type=desc&include=requester,company`
+    );
+    if (!res.ok || !Array.isArray(res.data) || res.data.length === 0) break;
+    const match = res.data.find(matchFn);
+    if (match) return match;
+    if (res.data.length < 100) break;
+    page++;
+  }
+  return null;
+}
+
 // ─── Lookup by ticket number ──────────────────────────────────────────────────
 async function resolveByTicketId(ticketInput) {
   const normalized = String(ticketInput || '').trim().replace(/^#/, '');
@@ -56,11 +74,8 @@ async function resolveByTicketId(ticketInput) {
   const searchQuery = encodeURIComponent(`display_id:${normalized}`);
   const search = await fdFetch(`/api/v2/search/tickets?query="${searchQuery}"`);
   if (search.ok && search.data?.results?.length > 0) {
-    const internalId = search.data.results[0].id;
-    if (internalId) {
-      const t = await fdGet(`/api/v2/tickets/${internalId}?include=requester,company`);
-      return { ticket: t, match_method: 'ticket_id' };
-    }
+    const t = await fdGet(`/api/v2/tickets/${search.data.results[0].id}?include=requester,company`);
+    return { ticket: t, match_method: 'ticket_id' };
   }
   return null;
 }
@@ -68,23 +83,34 @@ async function resolveByTicketId(ticketInput) {
 // ─── Lookup by email ──────────────────────────────────────────────────────────
 async function resolveByEmail(email) {
   if (!email || !email.includes('@')) return null;
-  const encoded = encodeURIComponent(email.trim().toLowerCase());
+  const lower = email.trim().toLowerCase();
 
-  const contacts = await fdFetch(`/api/v2/contacts?email=${encoded}`);
+  // 1. Standard contact lookup by requester email
+  const contacts = await fdFetch(`/api/v2/contacts?email=${encodeURIComponent(lower)}`);
   if (contacts.ok && Array.isArray(contacts.data) && contacts.data.length > 0) {
-    const contactId = contacts.data[0].id;
-    const tickets = await fdFetch(`/api/v2/tickets?requester_id=${contactId}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`);
+    const tickets = await fdFetch(
+      `/api/v2/tickets?requester_id=${contacts.data[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
+    );
     if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
       return { ticket: tickets.data[0], match_method: 'email', matched_contact: contacts.data[0] };
     }
   }
 
-  const searchQuery = encodeURIComponent(`email:${email.trim().toLowerCase()}`);
-  const search = await fdFetch(`/api/v2/search/tickets?query="${searchQuery}"`);
+  // 2. Freshdesk search API
+  const search = await fdFetch(
+    `/api/v2/search/tickets?query="${encodeURIComponent(`email:${lower}`)}"`
+  );
   if (search.ok && search.data?.results?.length > 0) {
     const t = await fdGet(`/api/v2/tickets/${search.data.results[0].id}?include=requester,company`);
     return { ticket: t, match_method: 'email' };
   }
+
+  // 3. Scan custom field cf_retailer_email (tickets submitted by retailer on behalf of customer)
+  const byRetailerEmail = await scanTicketsByCustomField(t =>
+    t.custom_fields?.cf_retailer_email?.toLowerCase() === lower
+  );
+  if (byRetailerEmail) return { ticket: byRetailerEmail, match_method: 'email' };
+
   return null;
 }
 
@@ -94,22 +120,41 @@ async function resolveByPhone(phone) {
   const cleaned = phone.replace(/[\s\-().+]/g, '');
   if (cleaned.length < 6) return null;
 
+  // Build AU variants
   const variants = [cleaned];
   if (cleaned.startsWith('0')) variants.push('61' + cleaned.slice(1));
   if (cleaned.startsWith('61')) variants.push('0' + cleaned.slice(2));
+  const last8 = cleaned.slice(-8); // last 8 digits for fuzzy match
 
+  // 1. Standard contact lookup by phone/mobile
   for (const variant of variants) {
     for (const field of ['mobile', 'phone']) {
       const contacts = await fdFetch(`/api/v2/contacts?${field}=${encodeURIComponent(variant)}`);
       if (contacts.ok && Array.isArray(contacts.data) && contacts.data.length > 0) {
-        const contactId = contacts.data[0].id;
-        const tickets = await fdFetch(`/api/v2/tickets?requester_id=${contactId}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`);
+        const tickets = await fdFetch(
+          `/api/v2/tickets?requester_id=${contacts.data[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
+        );
         if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
           return { ticket: tickets.data[0], match_method: 'phone', matched_contact: contacts.data[0] };
         }
       }
     }
   }
+
+  // 2. Scan custom field cf_phone_number (customer phone stored on ticket)
+  const byCustomPhone = await scanTicketsByCustomField(t => {
+    const val = (t.custom_fields?.cf_phone_number || '').replace(/\D/g, '');
+    return val.length >= 6 && val.endsWith(last8);
+  });
+  if (byCustomPhone) return { ticket: byCustomPhone, match_method: 'phone' };
+
+  // 3. Also check requester phone on the ticket object itself
+  const byRequesterPhone = await scanTicketsByCustomField(t => {
+    const val = (t.requester?.phone || t.requester?.mobile || '').replace(/\D/g, '');
+    return val.length >= 6 && val.endsWith(last8);
+  });
+  if (byRequesterPhone) return { ticket: byRequesterPhone, match_method: 'phone' };
+
   return null;
 }
 
@@ -117,49 +162,75 @@ async function resolveByPhone(phone) {
 async function resolveByName(name) {
   if (!name || name.trim().length < 2) return null;
   const trimmed = name.trim();
+  const lower = trimmed.toLowerCase();
 
+  // 1. Standard contact search
   const contacts = await fdFetch(`/api/v2/contacts?query=${encodeURIComponent(trimmed)}`);
   if (contacts.ok && Array.isArray(contacts.data) && contacts.data.length > 0) {
-    const lower = trimmed.toLowerCase();
     const best = contacts.data.find(c =>
       c.name?.toLowerCase() === lower || c.name?.toLowerCase().startsWith(lower)
     ) || contacts.data[0];
-
-    const tickets = await fdFetch(`/api/v2/tickets?requester_id=${best.id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`);
+    const tickets = await fdFetch(
+      `/api/v2/tickets?requester_id=${best.id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
+    );
     if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
       return { ticket: tickets.data[0], match_method: 'name', matched_contact: best };
     }
   }
 
-  const searchQuery = encodeURIComponent(`requester:"${trimmed}"`);
-  const search = await fdFetch(`/api/v2/search/tickets?query="${searchQuery}"`);
+  // 2. Freshdesk search API by requester name
+  const search = await fdFetch(
+    `/api/v2/search/tickets?query="${encodeURIComponent(`requester:"${trimmed}"`)}"`
+  );
   if (search.ok && search.data?.results?.length > 0) {
     const t = await fdGet(`/api/v2/tickets/${search.data.results[0].id}?include=requester,company`);
     return { ticket: t, match_method: 'name' };
   }
+
+  // 3. Scan custom field cf_customer_name
+  // This is the actual end-customer name when ticket was submitted by a retailer
+  const byCustomerName = await scanTicketsByCustomField(t => {
+    const val = (t.custom_fields?.cf_customer_name || '').toLowerCase();
+    return val && (val === lower || val.includes(lower) || lower.includes(val));
+  });
+  if (byCustomerName) return { ticket: byCustomerName, match_method: 'name' };
+
+  // 4. Scan custom field cf_contact_person (retailer contact person)
+  const byContactPerson = await scanTicketsByCustomField(t => {
+    const val = (t.custom_fields?.cf_contact_person || '').toLowerCase();
+    return val && (val === lower || val.includes(lower) || lower.includes(val));
+  });
+  if (byContactPerson) return { ticket: byContactPerson, match_method: 'name' };
+
   return null;
 }
 
 // ─── Lookup by street address ─────────────────────────────────────────────────
 async function resolveByAddress(address) {
   if (!address || address.trim().length < 4) return null;
-  const trimmed = address.trim();
+  const lower = address.trim().toLowerCase();
 
-  const searchQuery = encodeURIComponent(`"${trimmed}"`);
-  const search = await fdFetch(`/api/v2/search/tickets?query=${searchQuery}`);
-
+  // 1. Freshdesk full-text search
+  const search = await fdFetch(
+    `/api/v2/search/tickets?query=${encodeURIComponent(`"${address.trim()}"`)}`
+  );
   if (search.ok && search.data?.results?.length > 0) {
-    const lower = trimmed.toLowerCase();
-    const match = search.data.results.find(t => {
-      const addr = t.custom_fields?.cf_job_address || '';
-      return addr.toLowerCase().includes(lower);
-    }) || search.data.results[0];
-
+    const match = search.data.results.find(t =>
+      (t.custom_fields?.cf_job_address || '').toLowerCase().includes(lower)
+    ) || search.data.results[0];
     if (match?.id) {
       const t = await fdGet(`/api/v2/tickets/${match.id}?include=requester,company`);
       return { ticket: t, match_method: 'address' };
     }
   }
+
+  // 2. Scan custom field cf_job_address directly
+  const byAddress = await scanTicketsByCustomField(t => {
+    const val = (t.custom_fields?.cf_job_address || '').toLowerCase();
+    return val && val.includes(lower);
+  });
+  if (byAddress) return { ticket: byAddress, match_method: 'address' };
+
   return null;
 }
 
@@ -292,22 +363,33 @@ export default async function handler(req, res) {
 
     const agentStatusLabel    = mapStatusAgent(ticket.status);
     const customerStatusLabel = mapStatusCustomer(agentStatusLabel);
-    const subject             = ticket.subject?.trim() || 'No subject recorded';
-    const description         = stripHtml(ticket.description_text || ticket.description || '') || 'No description recorded';
-    const requester           = ticket.requester || matched_contact || {};
-    const company             = ticket.company || {};
-    const displayId           = ticket.display_id || ticket.id;
+
+    const subject     = ticket.subject?.trim() || 'No subject recorded';
+    const description = stripHtml(ticket.description_text || ticket.description || '') || 'No description recorded';
+    const displayId   = ticket.display_id || ticket.id;
+
+    // Use cf_customer_name if available (more accurate than requester which may be retailer)
+    const customerName = ticket.custom_fields?.cf_customer_name
+      || ticket.custom_fields?.cf_contact_person
+      || matched_contact?.name
+      || ticket.requester?.name
+      || '';
+
+    const requester = ticket.requester || matched_contact || {};
+    const company   = ticket.company || {};
 
     const customerVisibleCustomFields = getCustomerVisibleCustomFields(ticket, ticketFields);
-    const conversationUpdate  = await getLatestCustomerUpdate(ticket.id).catch(() => '');
-    const descriptionUpdate   = description !== 'No description recorded' ? summarizeCustomerUpdate(description) : '';
-    const latestUpdate        = conversationUpdate || descriptionUpdate || '';
+    const conversationUpdate = await getLatestCustomerUpdate(ticket.id).catch(() => '');
+    const descriptionUpdate  = description !== 'No description recorded' ? summarizeCustomerUpdate(description) : '';
+    const latestUpdate       = conversationUpdate || descriptionUpdate || '';
 
     const brief_summary  = latestUpdate
       ? `Ticket ${displayId} is currently ${customerStatusLabel}. Latest update: ${latestUpdate}`
       : `Ticket ${displayId} is currently ${customerStatusLabel}.`;
 
-    const spoken_summary = buildSpokenSummary(displayId, customerStatusLabel, subject, latestUpdate, match_method, requester.name || '');
+    const spoken_summary = buildSpokenSummary(
+      displayId, customerStatusLabel, subject, latestUpdate, match_method, customerName
+    );
 
     return res.status(200).json({
       found: true,
@@ -330,13 +412,13 @@ export default async function handler(req, res) {
       },
       requester: {
         id:    requester.id    || null,
-        name:  requester.name  || '',
+        name:  customerName,
         email: requester.email || '',
-        phone: requester.phone || requester.mobile || ''
+        phone: ticket.custom_fields?.cf_phone_number || requester.phone || requester.mobile || ''
       },
       company: {
         id:   company.id   || null,
-        name: company.name || ''
+        name: company.name || ticket.custom_fields?.cf_company || ''
       },
       custom_fields_for_customers: customerVisibleCustomFields,
       latest_update: latestUpdate,
