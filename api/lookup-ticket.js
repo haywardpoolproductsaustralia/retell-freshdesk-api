@@ -382,6 +382,15 @@ async function resolveByPhone(phone) {
   if (cleaned.startsWith('61')) variants.push('0' + cleaned.slice(2));
   const last8 = cleaned.slice(-8);
 
+  // Spaced formats as they appear in email signatures e.g. "0408 933 348"
+  const spacedVariants = variants.map(v => {
+    if (v.length === 10) return `${v.slice(0,4)} ${v.slice(4,7)} ${v.slice(7)}`;
+    if (v.length === 11) return `${v.slice(0,2)} ${v.slice(2,6)} ${v.slice(6,9)} ${v.slice(9)}`;
+    return null;
+  }).filter(Boolean);
+
+  const allVariants = [...new Set([...variants, ...spacedVariants, last8])];
+
   // 1. Standard contact lookup
   for (const variant of variants) {
     for (const field of ['mobile', 'phone']) {
@@ -397,18 +406,22 @@ async function resolveByPhone(phone) {
     }
   }
 
-  // 2. Deep scan all ticket fields for phone number variants
-  for (const variant of [last8, ...variants]) {
+  // 2. Deep scan ticket fields
+  for (const variant of allVariants) {
     const byDeep = await deepSearchTickets(variant);
     if (byDeep) return { ticket: byDeep, match_method: 'phone' };
   }
 
-  // 3. Search conversations
-  const byConversation = await deepSearchWithConversations(last8);
-  if (byConversation) return { ticket: byConversation, match_method: 'phone' };
+  // 3. Search conversation bodies — try all variants including spaced formats
+  // Phone numbers in email signatures often have spaces e.g. "0408 933 348"
+  for (const variant of allVariants) {
+    const byConversation = await deepSearchWithConversations(variant);
+    if (byConversation) return { ticket: byConversation, match_method: 'phone' };
+  }
 
   return null;
 }
+
 
 // ─── Fuzzy matching helpers ───────────────────────────────────────────────────
 
