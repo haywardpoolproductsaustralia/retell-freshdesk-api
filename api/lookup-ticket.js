@@ -215,11 +215,39 @@ async function scanAllTickets(matchFn, maxPages = 10) {
 }
 
 // ─── Deep search: scan ticket + its conversations for any text ───────────────
-async function deepSearchTickets(needle, maxPages = 10) {
+// ─── Scan ticket fields — uses search API first, pages as fallback ────────────
+async function deepSearchTickets(needle, maxPages = 3) {
   if (!needle || needle.length < 4) return null;
   const lower = needle.trim().toLowerCase();
-  let page = 1;
 
+  // 1. Freshdesk full-text search first (fast, server-side)
+  const encoded = encodeURIComponent(`"${needle.trim()}"`);
+  const search = await fdFetch(`/api/v2/search/tickets?query=${encoded}`);
+  if (search.ok && search.data?.results?.length > 0) {
+    // Verify the match is actually in the ticket fields (not just description)
+    for (const r of search.data.results.slice(0, 5)) {
+      const full = await fdGet(`/api/v2/tickets/${r.id}?include=requester,company`);
+      const searchable = [
+        full.subject || '',
+        stripHtml(full.description_text || full.description || ''),
+        full.requester?.email || '',
+        full.requester?.phone || '',
+        full.requester?.mobile || '',
+        full.requester?.name || '',
+        full.custom_fields?.cf_customer_name || '',
+        full.custom_fields?.cf_contact_person || '',
+        full.custom_fields?.cf_phone_number || '',
+        full.custom_fields?.cf_retailer_email || '',
+        full.custom_fields?.cf_job_address || '',
+        full.custom_fields?.cf_company || '',
+        full.custom_fields?.cf_serial_number || '',
+      ].join(' ').toLowerCase();
+      if (searchable.includes(lower)) return full;
+    }
+  }
+
+  // 2. Page fallback — reduced to 3 pages max (300 tickets) to avoid timeout
+  let page = 1;
   while (page <= maxPages) {
     const res = await fdFetch(
       `/api/v2/tickets?per_page=100&page=${page}&order_by=created_at&order_type=desc&include=requester,company`
@@ -227,7 +255,6 @@ async function deepSearchTickets(needle, maxPages = 10) {
     if (!res.ok || !Array.isArray(res.data) || res.data.length === 0) break;
 
     for (const ticket of res.data) {
-      // Search all text fields on the ticket
       const searchableText = [
         ticket.subject || '',
         stripHtml(ticket.description_text || ticket.description || ''),
@@ -235,7 +262,6 @@ async function deepSearchTickets(needle, maxPages = 10) {
         ticket.requester?.phone || '',
         ticket.requester?.mobile || '',
         ticket.requester?.name || '',
-        // Custom fields
         ticket.custom_fields?.cf_customer_name || '',
         ticket.custom_fields?.cf_contact_person || '',
         ticket.custom_fields?.cf_phone_number || '',
@@ -244,7 +270,6 @@ async function deepSearchTickets(needle, maxPages = 10) {
         ticket.custom_fields?.cf_company || '',
         ticket.custom_fields?.cf_serial_number || '',
       ].join(' ').toLowerCase();
-
       if (searchableText.includes(lower)) return ticket;
     }
 
@@ -254,23 +279,22 @@ async function deepSearchTickets(needle, maxPages = 10) {
   return null;
 }
 
+
 // ─── Search conversations — fast approach using search API + targeted fetch ───
+// ─── Search conversations via Freshdesk search API only (no paging fallback) ──
+// The fallback page-scan caused timeouts. We only use the search API here.
+// Freshdesk search indexes ticket descriptions and conversation bodies.
 async function deepSearchWithConversations(needle) {
   if (!needle || needle.length < 4) return null;
   const lower = needle.trim().toLowerCase();
 
-  // 1. Use Freshdesk full-text search first — finds matching tickets instantly
+  // Try Freshdesk full-text search — this indexes conversation bodies server-side
   const encoded = encodeURIComponent(`"${needle.trim()}"`);
   const search = await fdFetch(`/api/v2/search/tickets?query=${encoded}`);
 
   if (search.ok && search.data?.results?.length > 0) {
-    for (const candidate of search.data.results) {
-      // Check ticket description first
-      const desc = stripHtml(candidate.description || '').toLowerCase();
-      if (desc.includes(lower)) {
-        return await fdGet(`/api/v2/tickets/${candidate.id}?include=requester,company`);
-      }
-      // Check public conversations only
+    for (const candidate of search.data.results.slice(0, 5)) {
+      // Fetch only this ticket's conversations — targeted, not a full scan
       const convRes = await fdFetch(`/api/v2/tickets/${candidate.id}/conversations`);
       if (convRes.ok && Array.isArray(convRes.data)) {
         for (const convo of convRes.data) {
@@ -281,41 +305,17 @@ async function deepSearchWithConversations(needle) {
           }
         }
       }
+      // Also check description
+      const desc = stripHtml(candidate.description || '').toLowerCase();
+      if (desc.includes(lower)) {
+        return await fdGet(`/api/v2/tickets/${candidate.id}?include=requester,company`);
+      }
     }
-  }
-
-  // 2. Fallback: page recent tickets, fetch conversations in parallel batches of 10
-  let page = 1;
-  while (page <= 3) {
-    const res = await fdFetch(
-      `/api/v2/tickets?per_page=100&page=${page}&order_by=created_at&order_type=desc&include=requester,company`
-    );
-    if (!res.ok || !Array.isArray(res.data) || res.data.length === 0) break;
-
-    for (let i = 0; i < res.data.length; i += 10) {
-      const batch = res.data.slice(i, i + 10);
-      const results = await Promise.all(
-        batch.map(async ticket => {
-          const convRes = await fdFetch(`/api/v2/tickets/${ticket.id}/conversations`);
-          if (!convRes.ok || !Array.isArray(convRes.data)) return null;
-          for (const convo of convRes.data) {
-            if (convo.private) continue;
-            const text = extractConversationText(convo).toLowerCase();
-            if (text.includes(lower)) return ticket;
-          }
-          return null;
-        })
-      );
-      const found = results.find(r => r !== null);
-      if (found) return found;
-    }
-
-    if (res.data.length < 100) break;
-    page++;
   }
 
   return null;
 }
+
 
 
 // ─── Lookup by ticket number ──────────────────────────────────────────────────
