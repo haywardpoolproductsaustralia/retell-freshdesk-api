@@ -222,12 +222,12 @@ async function resolveByEmail(email) {
 
   // 1. Contact lookup by email field
   const contacts = await fdFetch(`/api/v2/contacts?email=${encodeURIComponent(lower)}`);
-  if (contacts.ok && Array.isArray(contacts.data) && contacts.data.length > 0) {
+  if (contacts.ok && Array.isArray(contacts.data?.value || contacts.data) && (contacts.data?.value || contacts.data).length > 0) {
     const tickets = await fdFetch(
-      `/api/v2/tickets?requester_id=${contacts.data[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
+      `/api/v2/tickets?requester_id=${(contacts.data?.value || contacts.data)[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
     );
     if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
-      return { ticket: tickets.data[0], match_method: 'email', matched_contact: contacts.data[0] };
+      return { ticket: tickets.data[0], match_method: 'email', matched_contact: (contacts.data?.value || contacts.data)[0] };
     }
   }
 
@@ -259,12 +259,12 @@ async function resolveByPhone(phone) {
   for (const variant of variants) {
     for (const field of ['mobile', 'phone']) {
       const contacts = await fdFetch(`/api/v2/contacts?${field}=${encodeURIComponent(variant)}`);
-      if (contacts.ok && Array.isArray(contacts.data) && contacts.data.length > 0) {
+      if (contacts.ok && Array.isArray(contacts.data?.value || contacts.data) && (contacts.data?.value || contacts.data).length > 0) {
         const tickets = await fdFetch(
-          `/api/v2/tickets?requester_id=${contacts.data[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
+          `/api/v2/tickets?requester_id=${(contacts.data?.value || contacts.data)[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
         );
         if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
-          return { ticket: tickets.data[0], match_method: 'phone', matched_contact: contacts.data[0] };
+          return { ticket: tickets.data[0], match_method: 'phone', matched_contact: (contacts.data?.value || contacts.data)[0] };
         }
       }
     }
@@ -280,7 +280,7 @@ async function resolveByPhone(phone) {
     ].map(v => v.replace(/[\s\-().+]/g, ''));
 
     for (const variant of [cleaned, last8]) {
-      if (phoneFields.some(f => f.includes(variant) || f.endsWith(last8))) {
+      if (phoneFields.some(f => f.length >= 6 && (f === variant || f.endsWith(last8)))) {
         return { ticket, match_method: 'phone' };
       }
     }
