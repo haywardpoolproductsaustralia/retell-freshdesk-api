@@ -280,7 +280,7 @@ function summarizeCustomerUpdate(text) {
 }
 
 function buildSpokenSummary(displayId, customerStatusLabel, subject, latestUpdate, matchMethod, requesterName) {
-  const parts = [`I've found your request.`];
+  const parts = [`Here are the details of your request.`];
   if (requesterName && matchMethod !== 'ticket_id') {
     parts.push(`I've matched this to the account for ${requesterName}.`);
   }
