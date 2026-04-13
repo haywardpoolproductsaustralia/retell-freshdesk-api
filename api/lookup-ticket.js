@@ -271,23 +271,39 @@ async function resolveByPhone(phone) {
   }
 
   // 2. Parallel page scan — check requester phone fields and cf_phone_number custom field
+  // cf_phone_number is stored as INTEGER in Freshdesk — must convert to string
   const allTickets = await fetchTicketPages(1, 5);
   for (const ticket of allTickets) {
-    const phoneFields = [
-      ticket.requester?.phone || '',
-      ticket.requester?.mobile || '',
-      ticket.custom_fields?.cf_phone_number || '',
-    ].map(v => v.replace(/[\s\-().+]/g, ''));
+    const rawFields = [
+      ticket.requester?.phone,
+      ticket.requester?.mobile,
+      ticket.custom_fields?.cf_phone_number,
+    ];
 
-    for (const variant of [cleaned, last8]) {
-      if (phoneFields.some(f => f.length >= 6 && (f === variant || f.endsWith(last8)))) {
-        return { ticket, match_method: 'phone' };
-      }
-    }
+    // Convert all to clean digit strings — handles integers, strings, nulls
+    const phoneFields = rawFields
+      .filter(v => v !== null && v !== undefined && v !== '')
+      .map(v => String(v).replace(/[\s\-().+]/g, ''));
+
+    // Match variants including with/without leading zero
+    // e.g. caller says 0408142437, Freshdesk stores 408142437
+    const searchVariants = [...new Set([
+      cleaned,
+      last8,
+      cleaned.replace(/^0+/, ''),   // strip leading zeros: 0408142437 → 408142437
+      '0' + cleaned.replace(/^0+/, ''),  // ensure one leading zero
+    ])];
+
+    const matched = phoneFields.some(f =>
+      f.length >= 6 && searchVariants.some(v => f === v || f.endsWith(last8))
+    );
+
+    if (matched) return { ticket, match_method: 'phone' };
   }
 
   return null;
 }
+
 
 // ─── Lookup by name (fuzzy — parallel batch scan) ────────────────────────────
 async function resolveByName(name) {
