@@ -379,27 +379,99 @@ async function resolveByPhone(phone) {
   return null;
 }
 
-// ─── Lookup by name ───────────────────────────────────────────────────────────
+// ─── Fuzzy matching helpers ───────────────────────────────────────────────────
+
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i-1] === b[j-1]
+        ? dp[i-1][j-1]
+        : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+    }
+  }
+  return dp[m][n];
+}
+
+function soundex(str) {
+  const s = str.toUpperCase().replace(/[^A-Z]/g, '');
+  if (!s) return '';
+  const map = { B:1,F:1,P:1,V:1, C:2,G:2,J:2,K:2,Q:2,S:2,X:2,Z:2, D:3,T:3, L:4, M:5,N:5, R:6 };
+  let code = s[0];
+  let prev = map[s[0]] || 0;
+  for (let i = 1; i < s.length && code.length < 4; i++) {
+    const curr = map[s[i]] || 0;
+    if (curr && curr !== prev) { code += curr; }
+    prev = curr;
+  }
+  return code.padEnd(4, '0');
+}
+
+function nameSimilarity(input, candidate) {
+  const a = input.toLowerCase().trim();
+  const b = candidate.toLowerCase().trim();
+  if (a === b) return 1.0;
+  if (b.includes(a) || a.includes(b)) return 0.9;
+  const aWords = a.split(/\s+/);
+  const bWords = b.split(/\s+/);
+  let wordScore = 0, wordCount = 0;
+  for (const aw of aWords) {
+    if (aw.length < 2) continue;
+    let best = 0;
+    for (const bw of bWords) {
+      if (bw.length < 2) continue;
+      const maxLen = Math.max(aw.length, bw.length);
+      const lev = 1 - levenshtein(aw, bw) / maxLen;
+      const snd = soundex(aw) === soundex(bw) ? 0.2 : 0;
+      best = Math.max(best, Math.min(1, lev + snd));
+    }
+    wordScore += best;
+    wordCount++;
+  }
+  return wordCount > 0 ? wordScore / wordCount : 0;
+}
+
+function bestFuzzyMatch(input, candidates, threshold = 0.72) {
+  let best = null;
+  candidates.forEach((candidate, index) => {
+    if (!candidate) return;
+    const score = nameSimilarity(input, candidate);
+    if (score >= threshold && (!best || score > best.score)) {
+      best = { index, score };
+    }
+  });
+  return best;
+}
+
+// ─── Lookup by name (with fuzzy matching) ────────────────────────────────────
 async function resolveByName(name) {
   if (!name || name.trim().length < 2) return null;
   const trimmed = name.trim();
   const lower = trimmed.toLowerCase();
 
-  // 1. Standard contact search
+  // 1. Standard Freshdesk contact search with fuzzy fallback
   const contacts = await fdFetch(`/api/v2/contacts?query=${encodeURIComponent(trimmed)}`);
   if (contacts.ok && Array.isArray(contacts.data) && contacts.data.length > 0) {
-    const best = contacts.data.find(c =>
-      c.name?.toLowerCase() === lower || c.name?.toLowerCase().startsWith(lower)
-    ) || contacts.data[0];
-    const tickets = await fdFetch(
-      `/api/v2/tickets?requester_id=${best.id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
-    );
-    if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
-      return { ticket: tickets.data[0], match_method: 'name', matched_contact: best };
+    const exact = contacts.data.find(c => c.name?.toLowerCase() === lower);
+    const contactToUse = exact || (() => {
+      const fuzzy = bestFuzzyMatch(trimmed, contacts.data.map(c => c.name || ''));
+      return fuzzy ? contacts.data[fuzzy.index] : null;
+    })();
+
+    if (contactToUse) {
+      const tickets = await fdFetch(
+        `/api/v2/tickets?requester_id=${contactToUse.id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
+      );
+      if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
+        return { ticket: tickets.data[0], match_method: 'name', matched_contact: contactToUse };
+      }
     }
   }
 
-  // 2. Freshdesk search
+  // 2. Freshdesk search API
   const search = await fdFetch(
     `/api/v2/search/tickets?query="${encodeURIComponent(`requester:"${trimmed}"`)}"`
   );
@@ -408,12 +480,41 @@ async function resolveByName(name) {
     return { ticket: t, match_method: 'name' };
   }
 
-  // 3. Deep scan custom fields cf_customer_name and cf_contact_person
-  const byDeep = await deepSearchTickets(lower);
-  if (byDeep) return { ticket: byDeep, match_method: 'name' };
+  // 3. Fuzzy scan all tickets — cf_customer_name, cf_contact_person, requester name
+  let page = 1;
+  const maxPages = 10;
+  let bestMatch = null;
+  let bestScore = 0;
 
+  while (page <= maxPages) {
+    const res = await fdFetch(
+      `/api/v2/tickets?per_page=100&page=${page}&order_by=created_at&order_type=desc&include=requester,company`
+    );
+    if (!res.ok || !Array.isArray(res.data) || res.data.length === 0) break;
+
+    for (const ticket of res.data) {
+      const candidates = [
+        ticket.custom_fields?.cf_customer_name || '',
+        ticket.custom_fields?.cf_contact_person || '',
+        ticket.requester?.name || ''
+      ];
+      const fuzzy = bestFuzzyMatch(trimmed, candidates);
+      if (fuzzy && fuzzy.score > bestScore) {
+        bestScore = fuzzy.score;
+        bestMatch = ticket;
+        if (bestScore >= 0.95) break;
+      }
+    }
+
+    if (bestScore >= 0.95) break;
+    if (res.data.length < 100) break;
+    page++;
+  }
+
+  if (bestMatch) return { ticket: bestMatch, match_method: 'name' };
   return null;
 }
+
 
 // ─── Lookup by address ────────────────────────────────────────────────────────
 async function resolveByAddress(address) {
