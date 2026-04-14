@@ -122,33 +122,30 @@ async function buildSmartSpokenSummary(ticket, customerStatusLabel, agentStatusL
   };
   parts.push(statusPhrases[customerStatusLabel] || `It's currently ${customerStatusLabel}.`);
 
-  if (latestUpdate) {
-    const intro = latestUpdate.date ? `The last update was ${formatSpokenDate(latestUpdate.date)}` : `The latest update`;
-    const text  = latestUpdate.text;
-    if (partsReplaced && !['Resolved','Closed'].includes(agentStatusLabel)) {
-      parts.push(`${intro} — parts ${partsReplaced} have been identified for this repair.`);
-    } else if (/waiting|part/i.test(text)) {
-      parts.push(`${intro} — the team is waiting on parts or a supplier response before they can proceed.`);
-    } else if (/schedul|appointment|book/i.test(text)) {
-      parts.push(`${intro} — a technician appointment has been scheduled.`);
-    } else if (/complet|resolv|fixed/i.test(text)) {
-      parts.push(`${intro} — the repair has been completed.`);
-    } else if (/review|assess/i.test(text)) {
-      parts.push(`${intro} — the team has reviewed your case and is determining the next steps.`);
-    } else if (text.length > 20) {
-      parts.push(`${intro} — ${text.slice(0, 200).replace(/\n/g, ' ').replace(/\s+/g, ' ').trim()}`);
-    }
+  // Use ticket STATUS as the source of truth — never infer from text keywords
+  // Only mention parts if explicitly recorded on the ticket
+  if (partsReplaced && !['Resolved','Closed'].includes(agentStatusLabel)) {
+    const intro = latestUpdate?.date ? `The last update was ${formatSpokenDate(latestUpdate.date)}` : `The latest update`;
+    parts.push(`${intro} — parts have been identified and the repair is being progressed.`);
+  } else if (latestUpdate?.date) {
+    parts.push(`The last update was ${formatSpokenDate(latestUpdate.date)}.`);
   }
 
+  // Next steps based purely on ticket status — never guessed from keywords
   if (['Resolved','Closed'].includes(agentStatusLabel)) {
     parts.push(`If you have any further concerns, please don't hesitate to call us back.`);
   } else if (customerStatusLabel === 'Waiting for more information') {
     parts.push(`Our team will need some additional information from you. Someone from Hayward will be in touch shortly.`);
+  } else if (customerStatusLabel === 'Waiting for parts to arrive') {
+    parts.push(`Once the parts arrive our team will be in touch to progress the repair.`);
+  } else if (customerStatusLabel === 'Waiting for technician arrival') {
+    parts.push(`A technician has been scheduled and will be in touch to confirm the appointment.`);
+  } else if (customerStatusLabel === 'Allocated') {
+    parts.push(`A technician has been allocated to your case and will be in touch shortly.`);
   } else {
     parts.push(`There's nothing you need to do right now. As soon as there's an update, someone from the Hayward team will reach out to you directly.`);
   }
 
-  return parts.join(' ');
 }
 
 // ─── Fuzzy matching ───────────────────────────────────────────────────────────
