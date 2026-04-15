@@ -8084,26 +8084,22 @@ function findNearestDealers(callerPostcode, count = 5) {
     .slice(0, count);
 }
 
-// ─── Spoken summary (top 3 read aloud) ───────────────────────────────────────
+// ─── Spoken summary — short, offer SMS immediately ───────────────────────────
 function buildSpokenSummary(dealers, postcode) {
   if (!dealers.length) {
-    return 'I wasn\'t able to find any dealers near that postcode. Please visit the Hayward Australia website and use the Dealer Locator.';
+    return "I wasn't able to find any dealers near that postcode. Please visit the Hayward Australia website and use the Dealer Locator.";
   }
 
-  const top3 = dealers.slice(0, 3);
-  const parts = ['I found ' + dealers.length + ' dealers near you. Here are the closest ones.'];
+  const nearest = dealers[0];
+  const dist = nearest.distance_km < 5
+    ? 'very close to you'
+    : 'about ' + nearest.distance_km + ' kilometres away';
 
-  top3.forEach((d, i) => {
-    const phone = cleanPhone(d.phone);
-    const dist = d.distance_km < 5 ? 'very close to you' : 'about ' + d.distance_km + ' kilometres away';
-    const phoneText = phone ? ' Their phone number is ' + phone + '.' : '';
-    parts.push('Number ' + (i + 1) + ': ' + d.name + ', located in ' + d.suburb + ', ' + dist + '.' + phoneText);
-  });
-
-  parts.push('Would you like me to send the full list with addresses to your mobile as a text message?');
-
-  return parts.join(' ');
+  return 'I found ' + dealers.length + ' authorised Hayward dealers near you. '
+    + 'The closest is ' + nearest.name + ' in ' + nearest.suburb + ', ' + dist + '. '
+    + 'Would you like me to send the full list with all addresses and phone numbers to your mobile as a text message?';
 }
+
 
 // ─── SMS text ─────────────────────────────────────────────────────────────────
 function buildSmsText(dealers, postcode) {
