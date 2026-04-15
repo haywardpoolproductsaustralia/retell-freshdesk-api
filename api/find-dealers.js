@@ -8130,7 +8130,19 @@ export default async function handler(req, res) {
 
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
-    const postcode = String(body?.postcode || '').trim().replace(/\D/g, '');
+    const rawPostcode = String(body?.postcode || '').trim();
+
+    // Convert spoken words to digits e.g. "three eight zero two" → "3802"
+    const wordToDigit = {
+      'zero':'0','oh':'0','one':'1','two':'2','three':'3',
+      'four':'4','for':'4','fore':'4','five':'5','six':'6',
+      'seven':'7','eight':'8','ate':'8','nine':'9'
+    };
+    const postcode = rawPostcode
+      .toLowerCase()
+      .replace(/\b(zero|oh|one|two|three|four|for|fore|five|six|seven|eight|ate|nine)\b/g,
+        w => wordToDigit[w] || w)
+      .replace(/\D/g, '');
 
     if (!postcode || postcode.length !== 4) {
       return res.status(200).json({
