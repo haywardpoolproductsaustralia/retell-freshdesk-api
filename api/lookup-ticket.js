@@ -1,8 +1,16 @@
-const FRESHDESK_DOMAIN = process.env.FRESHDESK_DOMAIN;
-const FRESHDESK_API_KEY = process.env.FRESHDESK_API_KEY;
+// ─── Platform configs ─────────────────────────────────────────────────────────
+// "old" = your existing Freshdesk env vars (unchanged, already in Vercel)
+// "new" = the new Freshdesk platform — add these two env vars in Vercel:
+//   FRESHDESK_DOMAIN_NEW = hayward9702.freshdesk.com
+//   FRESHDESK_API_KEY_NEW = <rotate the key you pasted in chat, then use the new value>
+// If a platform's env vars aren't set, it's skipped automatically (no crash).
+const PLATFORMS = [
+  { label: 'new', domain: process.env.FRESHDESK_DOMAIN_NEW, apiKey: process.env.FRESHDESK_API_KEY_NEW },
+  { label: 'old', domain: process.env.FRESHDESK_DOMAIN,     apiKey: process.env.FRESHDESK_API_KEY     },
+].filter(p => p.domain && p.apiKey);
 
-function authHeader() {
-  return 'Basic ' + Buffer.from(`${FRESHDESK_API_KEY}:X`).toString('base64');
+function authHeader(apiKey) {
+  return 'Basic ' + Buffer.from(`${apiKey}:X`).toString('base64');
 }
 
 function stripHtml(html) {
@@ -29,34 +37,48 @@ function mapStatusCustomer(agentLabel) {
   return map[agentLabel] || agentLabel;
 }
 
-async function fdFetch(path) {
-  const res = await fetch(`https://${FRESHDESK_DOMAIN}${path}`, {
-    headers: { Authorization: authHeader(), 'Content-Type': 'application/json' }
+// ─── Platform-aware fetch helpers ────────────────────────────────────────────
+async function fdFetch(platform, path) {
+  const res = await fetch(`https://${platform.domain}${path}`, {
+    headers: { Authorization: authHeader(platform.apiKey), 'Content-Type': 'application/json' }
   });
   const text = await res.text();
   let data;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  return { ok: res.ok, status: res.status, data };
+  return { ok: res.ok, status: res.status, data, platform };
 }
 
-async function fdGet(path) {
-  const res = await fdFetch(path);
-  if (!res.ok) throw new Error(`Freshdesk API error ${res.status}: ${JSON.stringify(res.data)}`);
+async function fdGet(platform, path) {
+  const res = await fdFetch(platform, path);
+  if (!res.ok) throw new Error(`Freshdesk API error (${platform.label}) ${res.status}: ${JSON.stringify(res.data)}`);
   return res.data;
 }
 
-// ─── Fetch ticket pages in parallel ──────────────────────────────────────────
-async function fetchTicketPages(fromPage, toPage) {
+// ─── Fetch ticket pages in parallel (single platform) ────────────────────────
+async function fetchTicketPages(platform, fromPage, toPage) {
   const promises = [];
   for (let p = fromPage; p <= toPage; p++) {
     promises.push(
-      fdFetch(`/api/v2/tickets?per_page=100&page=${p}&order_by=created_at&order_type=desc&include=requester,company`)
+      fdFetch(platform, `/api/v2/tickets?per_page=100&page=${p}&order_by=created_at&order_type=desc&include=requester,company`)
         .then(r => (r.ok && Array.isArray(r.data)) ? r.data : [])
         .catch(() => [])
     );
   }
   const results = await Promise.all(promises);
   return results.flat();
+}
+
+// ─── Run a resolver against every configured platform in parallel ───────────
+// If more than one platform finds a match, prefer the most recently created ticket.
+async function resolveAcrossPlatforms(resolverFn, ...args) {
+  const attempts = await Promise.all(
+    PLATFORMS.map(platform => resolverFn(platform, ...args).catch(() => null))
+  );
+  const found = attempts.filter(Boolean);
+  if (found.length === 0) return null;
+  if (found.length === 1) return found[0];
+  found.sort((a, b) => new Date(b.ticket.created_at) - new Date(a.ticket.created_at));
+  return found[0];
 }
 
 // ─── Date formatting ──────────────────────────────────────────────────────────
@@ -72,8 +94,8 @@ function formatSpokenDate(dateStr) {
 }
 
 // ─── Get public conversations only ───────────────────────────────────────────
-async function getLatestUpdate(ticketId, description) {
-  const res = await fdFetch(`/api/v2/tickets/${ticketId}/conversations`);
+async function getLatestUpdate(platform, ticketId, description) {
+  const res = await fdFetch(platform, `/api/v2/tickets/${ticketId}/conversations`);
   if (res.ok && Array.isArray(res.data)) {
     for (const convo of [...res.data].reverse()) {
       if (convo.private) continue;
@@ -87,7 +109,7 @@ async function getLatestUpdate(ticketId, description) {
 }
 
 // ─── Smart spoken summary ─────────────────────────────────────────────────────
-async function buildSmartSpokenSummary(ticket, customerStatusLabel, agentStatusLabel) {
+async function buildSmartSpokenSummary(platform, ticket, customerStatusLabel, agentStatusLabel) {
   const cf = ticket.custom_fields || {};
   const productLine  = cf.cf_product_line248059 || cf.cf_product_line || '';
   const productModel = cf.cf_model760094 || cf.cf_model365636 || cf.cf_model289096 || '';
@@ -95,7 +117,7 @@ async function buildSmartSpokenSummary(ticket, customerStatusLabel, agentStatusL
   const createdDate  = formatSpokenDate(ticket.created_at);
   const issueText    = ticket.subject?.trim() || stripHtml(ticket.description_text || '').slice(0, 120) || '';
   const partsReplaced = cf.cf_parts_replaced || '';
-  const latestUpdate = await getLatestUpdate(ticket.id, ticket.description_text || ticket.description);
+  const latestUpdate = await getLatestUpdate(platform, ticket.id, ticket.description_text || ticket.description);
   const parts = [`Alright, I've found your request.`];
 
   if (createdDate && issueText) {
@@ -146,6 +168,7 @@ async function buildSmartSpokenSummary(ticket, customerStatusLabel, agentStatusL
     parts.push(`There's nothing you need to do right now. As soon as there's an update, someone from the Hayward team will reach out to you directly.`);
   }
 
+  return parts.join(' ');
 }
 
 // ─── Fuzzy matching ───────────────────────────────────────────────────────────
@@ -203,46 +226,47 @@ function bestFuzzyMatch(input, candidates, threshold = 0.72) {
   return best;
 }
 
-// ─── Lookup by ticket number ──────────────────────────────────────────────────
-async function resolveByTicketId(ticketInput) {
+// ─── Lookup by ticket number (single platform) ───────────────────────────────
+async function resolveByTicketId(platform, ticketInput) {
   const normalized = String(ticketInput || '').trim().replace(/^#/, '');
   if (!normalized || !/^\d+$/.test(normalized)) return null;
-  const direct = await fdFetch(`/api/v2/tickets/${normalized}?include=requester,company`);
-  if (direct.ok && direct.data?.id) return { ticket: direct.data, match_method: 'ticket_id' };
+  const direct = await fdFetch(platform, `/api/v2/tickets/${normalized}?include=requester,company`);
+  if (direct.ok && direct.data?.id) return { ticket: direct.data, match_method: 'ticket_id', platform };
   return null;
 }
 
-// ─── Lookup by email ──────────────────────────────────────────────────────────
-async function resolveByEmail(email) {
+// ─── Lookup by email (single platform) ───────────────────────────────────────
+async function resolveByEmail(platform, email) {
   if (!email || !email.includes('@')) return null;
   const lower = email.trim().toLowerCase();
 
   // 1. Contact lookup by email field
-  const contacts = await fdFetch(`/api/v2/contacts?email=${encodeURIComponent(lower)}`);
+  const contacts = await fdFetch(platform, `/api/v2/contacts?email=${encodeURIComponent(lower)}`);
   if (contacts.ok && Array.isArray(contacts.data?.value || contacts.data) && (contacts.data?.value || contacts.data).length > 0) {
     const tickets = await fdFetch(
+      platform,
       `/api/v2/tickets?requester_id=${(contacts.data?.value || contacts.data)[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
     );
     if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
-      return { ticket: tickets.data[0], match_method: 'email', matched_contact: (contacts.data?.value || contacts.data)[0] };
+      return { ticket: tickets.data[0], match_method: 'email', matched_contact: (contacts.data?.value || contacts.data)[0], platform };
     }
   }
 
   // 2. Parallel page scan — check requester.email and cf_retailer_email
-  const allTickets = await fetchTicketPages(1, 5);
+  const allTickets = await fetchTicketPages(platform, 1, 5);
   const match = allTickets.find(t =>
     t.requester?.email?.toLowerCase() === lower ||
     (t.custom_fields?.cf_retailer_email || '').toLowerCase() === lower
   );
-  if (match) return { ticket: match, match_method: 'email' };
+  if (match) return { ticket: match, match_method: 'email', platform };
 
   return null;
 }
 
-// ─── Lookup by phone ──────────────────────────────────────────────────────────
+// ─── Lookup by phone (single platform) ───────────────────────────────────────
 // Only searches structured fields — requester phone/mobile and cf_phone_number
 // Does NOT scan email bodies or conversation text
-async function resolveByPhone(phone) {
+async function resolveByPhone(platform, phone) {
   if (!phone) return null;
   const cleaned = phone.replace(/[\s\-().+]/g, '');
   if (cleaned.length < 6) return null;
@@ -255,13 +279,14 @@ async function resolveByPhone(phone) {
   // 1. Contact lookup by mobile/phone field
   for (const variant of variants) {
     for (const field of ['mobile', 'phone']) {
-      const contacts = await fdFetch(`/api/v2/contacts?${field}=${encodeURIComponent(variant)}`);
+      const contacts = await fdFetch(platform, `/api/v2/contacts?${field}=${encodeURIComponent(variant)}`);
       if (contacts.ok && Array.isArray(contacts.data?.value || contacts.data) && (contacts.data?.value || contacts.data).length > 0) {
         const tickets = await fdFetch(
+          platform,
           `/api/v2/tickets?requester_id=${(contacts.data?.value || contacts.data)[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
         );
         if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
-          return { ticket: tickets.data[0], match_method: 'phone', matched_contact: (contacts.data?.value || contacts.data)[0] };
+          return { ticket: tickets.data[0], match_method: 'phone', matched_contact: (contacts.data?.value || contacts.data)[0], platform };
         }
       }
     }
@@ -269,7 +294,7 @@ async function resolveByPhone(phone) {
 
   // 2. Parallel page scan — check requester phone fields and cf_phone_number custom field
   // cf_phone_number is stored as INTEGER in Freshdesk — must convert to string
-  const allTickets = await fetchTicketPages(1, 5);
+  const allTickets = await fetchTicketPages(platform, 1, 5);
   for (const ticket of allTickets) {
     const rawFields = [
       ticket.requester?.phone,
@@ -295,20 +320,19 @@ async function resolveByPhone(phone) {
       f.length >= 6 && searchVariants.some(v => f === v || f.endsWith(last8))
     );
 
-    if (matched) return { ticket, match_method: 'phone' };
+    if (matched) return { ticket, match_method: 'phone', platform };
   }
 
   return null;
 }
 
-
-// ─── Lookup by name (fuzzy — parallel batch scan) ────────────────────────────
-async function resolveByName(name) {
+// ─── Lookup by name (single platform — fuzzy, parallel batch scan) ──────────
+async function resolveByName(platform, name) {
   if (!name || name.trim().length < 2) return null;
   const trimmed = name.trim();
 
   // Parallel fetch of first 10 pages (up to 1000 tickets)
-  const allTickets = await fetchTicketPages(1, 10);
+  const allTickets = await fetchTicketPages(platform, 1, 10);
 
   let bestMatch = null;
   let bestScore = 0;
@@ -327,30 +351,30 @@ async function resolveByName(name) {
     }
   }
 
-  if (bestMatch) return { ticket: bestMatch, match_method: 'name' };
+  if (bestMatch) return { ticket: bestMatch, match_method: 'name', platform };
   return null;
 }
 
-// ─── Lookup by address ────────────────────────────────────────────────────────
-async function resolveByAddress(address) {
+// ─── Lookup by address (single platform) ─────────────────────────────────────
+async function resolveByAddress(platform, address) {
   if (!address || address.trim().length < 4) return null;
   const lower = address.trim().toLowerCase();
 
-  const allTickets = await fetchTicketPages(1, 5);
+  const allTickets = await fetchTicketPages(platform, 1, 5);
   const match = allTickets.find(t =>
     (t.custom_fields?.cf_job_address || '').toLowerCase().includes(lower)
   );
-  if (match) return { ticket: match, match_method: 'address' };
+  if (match) return { ticket: match, match_method: 'address', platform };
   return null;
 }
 
-// ─── Master resolver ──────────────────────────────────────────────────────────
+// ─── Master resolver — tries both platforms in parallel for each field ──────
 async function resolveTicket({ ticket_id, email, phone, name, address }) {
-  if (ticket_id) { const r = await resolveByTicketId(ticket_id); if (r) return r; }
-  if (email)     { const r = await resolveByEmail(email);         if (r) return r; }
-  if (phone)     { const r = await resolveByPhone(phone);         if (r) return r; }
-  if (name)      { const r = await resolveByName(name);           if (r) return r; }
-  if (address)   { const r = await resolveByAddress(address);     if (r) return r; }
+  if (ticket_id) { const r = await resolveAcrossPlatforms(resolveByTicketId, ticket_id); if (r) return r; }
+  if (email)     { const r = await resolveAcrossPlatforms(resolveByEmail, email);         if (r) return r; }
+  if (phone)     { const r = await resolveAcrossPlatforms(resolveByPhone, phone);         if (r) return r; }
+  if (name)      { const r = await resolveAcrossPlatforms(resolveByName, name);           if (r) return r; }
+  if (address)   { const r = await resolveAcrossPlatforms(resolveByAddress, address);     if (r) return r; }
   return null;
 }
 
@@ -368,6 +392,14 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  if (PLATFORMS.length === 0) {
+    console.error('lookup-ticket: no Freshdesk platforms configured — check env vars');
+    return res.status(500).json({
+      found: false,
+      spoken_summary: "I wasn't able to retrieve your request details right now. Let me transfer you to our support team who can assist you directly."
+    });
+  }
 
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
@@ -392,8 +424,8 @@ export default async function handler(req, res) {
       });
     }
 
-    const { ticket, match_method, matched_contact } = result;
-    const ticketFields        = await fdGet('/api/v2/admin/ticket_fields').catch(() => []);
+    const { ticket, match_method, matched_contact, platform } = result;
+    const ticketFields        = await fdGet(platform, '/api/v2/admin/ticket_fields').catch(() => []);
     const agentStatusLabel    = mapStatusAgent(ticket.status);
     const customerStatusLabel = mapStatusCustomer(agentStatusLabel);
     const displayId           = ticket.display_id || ticket.id;
@@ -402,12 +434,13 @@ export default async function handler(req, res) {
     const requester           = ticket.requester || matched_contact || {};
     const company             = ticket.company || {};
 
-    const spoken_summary = await buildSmartSpokenSummary(ticket, customerStatusLabel, agentStatusLabel);
+    const spoken_summary = await buildSmartSpokenSummary(platform, ticket, customerStatusLabel, agentStatusLabel);
     const brief_summary  = `Ticket ${displayId} — ${customerStatusLabel}. Customer: ${customerName}.`;
 
     return res.status(200).json({
       found: true,
       match_method,
+      platform: platform.label, // 'new' or 'old' — which Freshdesk this came from
       ticket_id: ticket.id,
       display_id: displayId,
       status: { raw_value: ticket.status, agent_label: agentStatusLabel, customer_value_label: customerStatusLabel },
