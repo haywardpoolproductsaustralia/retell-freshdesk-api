@@ -9,6 +9,19 @@ const PLATFORMS = [
   { label: 'old', domain: process.env.FRESHDESK_DOMAIN,     apiKey: process.env.FRESHDESK_API_KEY     },
 ].filter(p => p.domain && p.apiKey);
 
+// ─── Age cutoff ───────────────────────────────────────────────────────────────
+// Tickets older than this are treated as if they don't exist, in every lookup
+// path (ticket ID, email, phone, name, address). This is what stops a stale
+// 2023 ticket on the old platform from winning over a genuinely current one —
+// or from being found at all if it's the only match for a given ID/contact.
+const TICKET_AGE_CUTOFF_MONTHS = 12;
+function isWithinCutoff(ticket) {
+  if (!ticket?.created_at) return true; // unknown date — don't drop defensively
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - TICKET_AGE_CUTOFF_MONTHS);
+  return new Date(ticket.created_at) >= cutoff;
+}
+
 function authHeader(apiKey) {
   return 'Basic ' + Buffer.from(`${apiKey}:X`).toString('base64');
 }
@@ -65,7 +78,7 @@ async function fetchTicketPages(platform, fromPage, toPage) {
     );
   }
   const results = await Promise.all(promises);
-  return results.flat();
+  return results.flat().filter(isWithinCutoff);
 }
 
 // ─── Run a resolver against every configured platform in parallel ───────────
@@ -231,7 +244,7 @@ async function resolveByTicketId(platform, ticketInput) {
   const normalized = String(ticketInput || '').trim().replace(/^#/, '');
   if (!normalized || !/^\d+$/.test(normalized)) return null;
   const direct = await fdFetch(platform, `/api/v2/tickets/${normalized}?include=requester,company`);
-  if (direct.ok && direct.data?.id) return { ticket: direct.data, match_method: 'ticket_id', platform };
+  if (direct.ok && direct.data?.id && isWithinCutoff(direct.data)) return { ticket: direct.data, match_method: 'ticket_id', platform };
   return null;
 }
 
@@ -247,7 +260,7 @@ async function resolveByEmail(platform, email) {
       platform,
       `/api/v2/tickets?requester_id=${(contacts.data?.value || contacts.data)[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
     );
-    if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
+    if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0 && isWithinCutoff(tickets.data[0])) {
       return { ticket: tickets.data[0], match_method: 'email', matched_contact: (contacts.data?.value || contacts.data)[0], platform };
     }
   }
@@ -285,7 +298,7 @@ async function resolveByPhone(platform, phone) {
           platform,
           `/api/v2/tickets?requester_id=${(contacts.data?.value || contacts.data)[0].id}&order_by=created_at&order_type=desc&per_page=1&include=requester,company`
         );
-        if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0) {
+        if (tickets.ok && Array.isArray(tickets.data) && tickets.data.length > 0 && isWithinCutoff(tickets.data[0])) {
           return { ticket: tickets.data[0], match_method: 'phone', matched_contact: (contacts.data?.value || contacts.data)[0], platform };
         }
       }
