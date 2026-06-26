@@ -1,13 +1,19 @@
-// ─── Platform configs ─────────────────────────────────────────────────────────
-// "old" = your existing Freshdesk env vars (unchanged, already in Vercel)
-// "new" = the new Freshdesk platform — add these two env vars in Vercel:
-//   FRESHDESK_DOMAIN_NEW = hayward9702.freshdesk.com
-//   FRESHDESK_API_KEY_NEW = <rotate the key you pasted in chat, then use the new value>
-// If a platform's env vars aren't set, it's skipped automatically (no crash).
-const PLATFORMS = [
-  { label: 'new', domain: process.env.FRESHDESK_DOMAIN_NEW, apiKey: process.env.FRESHDESK_API_KEY_NEW },
-  { label: 'old', domain: process.env.FRESHDESK_DOMAIN,     apiKey: process.env.FRESHDESK_API_KEY     },
-].filter(p => p.domain && p.apiKey);
+// ─── Freshdesk platform (NEW instance only) ──────────────────────────────────
+// The old/legacy Freshdesk has been removed entirely. This only ever talks to
+// the new platform below. The domain is not a secret, so it's hardcoded here —
+// this also removes the "env var missing" failure mode. The API key IS a secret
+// and comes from Vercel.
+//
+// Vercel env var required (Settings → Environment Variables):
+//   FRESHDESK_API_KEY = <your new, rotated Freshdesk API key>
+//
+// You can safely delete these now-unused vars: FRESHDESK_DOMAIN,
+// FRESHDESK_DOMAIN_NEW, FRESHDESK_API_KEY_NEW.
+const PLATFORM = {
+  label: 'new',
+  domain: 'hayward9702.freshdesk.com',
+  apiKey: process.env.FRESHDESK_API_KEY,
+};
 
 // ─── Age cutoff ───────────────────────────────────────────────────────────────
 // Tickets older than this are treated as if they don't exist, in every lookup
@@ -81,18 +87,9 @@ async function fetchTicketPages(platform, fromPage, toPage) {
   return results.flat().filter(isWithinCutoff);
 }
 
-// ─── Run a resolver against every configured platform in parallel ───────────
-// If more than one platform finds a match, prefer the most recently created ticket.
-async function resolveAcrossPlatforms(resolverFn, ...args) {
-  const attempts = await Promise.all(
-    PLATFORMS.map(platform => resolverFn(platform, ...args).catch(() => null))
-  );
-  const found = attempts.filter(Boolean);
-  if (found.length === 0) return null;
-  if (found.length === 1) return found[0];
-  found.sort((a, b) => new Date(b.ticket.created_at) - new Date(a.ticket.created_at));
-  return found[0];
-}
+// ─── (Removed) Cross-platform resolver ───────────────────────────────────────
+// With a single platform there's nothing to merge or rank — resolvers are now
+// called directly against PLATFORM in resolveTicket().
 
 // ─── Date formatting ──────────────────────────────────────────────────────────
 function formatSpokenDate(dateStr) {
@@ -381,13 +378,14 @@ async function resolveByAddress(platform, address) {
   return null;
 }
 
-// ─── Master resolver — tries both platforms in parallel for each field ──────
+// ─── Master resolver — runs each field against the single platform ──────────
+// Each resolver is wrapped in .catch so one failing field never blocks the next.
 async function resolveTicket({ ticket_id, email, phone, name, address }) {
-  if (ticket_id) { const r = await resolveAcrossPlatforms(resolveByTicketId, ticket_id); if (r) return r; }
-  if (email)     { const r = await resolveAcrossPlatforms(resolveByEmail, email);         if (r) return r; }
-  if (phone)     { const r = await resolveAcrossPlatforms(resolveByPhone, phone);         if (r) return r; }
-  if (name)      { const r = await resolveAcrossPlatforms(resolveByName, name);           if (r) return r; }
-  if (address)   { const r = await resolveAcrossPlatforms(resolveByAddress, address);     if (r) return r; }
+  if (ticket_id) { const r = await resolveByTicketId(PLATFORM, ticket_id).catch(() => null); if (r) return r; }
+  if (email)     { const r = await resolveByEmail(PLATFORM, email).catch(() => null);         if (r) return r; }
+  if (phone)     { const r = await resolveByPhone(PLATFORM, phone).catch(() => null);         if (r) return r; }
+  if (name)      { const r = await resolveByName(PLATFORM, name).catch(() => null);           if (r) return r; }
+  if (address)   { const r = await resolveByAddress(PLATFORM, address).catch(() => null);     if (r) return r; }
   return null;
 }
 
@@ -406,8 +404,8 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  if (PLATFORMS.length === 0) {
-    console.error('lookup-ticket: no Freshdesk platforms configured — check env vars');
+  if (!PLATFORM.apiKey) {
+    console.error('lookup-ticket: FRESHDESK_API_KEY is not set in Vercel env vars');
     return res.status(500).json({
       found: false,
       spoken_summary: "I wasn't able to retrieve your request details right now. Let me transfer you to our support team who can assist you directly."
